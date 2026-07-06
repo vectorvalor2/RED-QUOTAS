@@ -5,15 +5,17 @@ from datetime import datetime
 from typing import Optional
 import shutil
 import asyncio
+import sys
 
 logger = logging.getLogger(__name__)
+
 
 class REDProcessor:
     """RED (Replicant, Extract, Deduplicate) processor
 
-    This implementation provides a minimal CPU-backed processing path
-    suitable for end-to-end testing and MVP runs. The real Vulkan
-    implementation is still TODO and should replace / extend this class.
+    This implementation provides a CPU-backed processing path using ffmpeg
+    where available. If ffmpeg is not installed, it falls back to the
+    simple copy behavior used previously.
     """
 
     def __init__(self, settings):
@@ -57,17 +59,74 @@ class REDProcessor:
         logger.info(f"Saved file: {file_path}")
         return str(file_path)
 
-    async def process_clip(self, clip_id: str) -> Optional[str]:
-        """Process clip through RED pipeline (CPU fallback)
+    async def _run_ffmpeg(self, input_path: str, output_path: str) -> bool:
+        """Run ffmpeg asynchronously to transcode input -> output.
 
-        This minimal implementation looks for any file uploaded under
-        storage_path/{clip_id}/ and copies the first file to
-        storage_path/{clip_id}/output.mp4 to simulate processing.
-        It sleeps briefly to emulate processing time.
+        Returns True on success, False otherwise.
+        """
+        ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            logger.warning("ffmpeg not found on PATH, cannot run ffmpeg transcode")
+            return False
+
+        cmd = [
+            ffmpeg,
+            '-y',
+            '-i', str(input_path),
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            str(output_path)
+        ]
+
+        logger.info(f"Running ffmpeg: {' '.join(cmd)}")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            # Read stderr and log progress snippets
+            assert proc.stderr is not None
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                try:
+                    decoded = line.decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    decoded = str(line)
+                # Log ffmpeg stderr at debug level to avoid noisy logs by default
+                logger.debug(f"ffmpeg: {decoded}")
+
+            returncode = await proc.wait()
+            if returncode != 0:
+                logger.error(f"ffmpeg failed with return code {returncode}")
+                return False
+
+            logger.info(f"ffmpeg completed successfully: {output_path}")
+            return True
+        except Exception as e:
+            logger.exception(f"Error running ffmpeg: {e}")
+            return False
+
+    async def process_clip(self, clip_id: str) -> Optional[str]:
+        """Process clip through RED pipeline using ffmpeg fallback
+
+        Behavior:
+        - Looks for the first uploaded file in storage_path/{clip_id}/
+        - Attempts to transcode it to H.264 MP4 via ffmpeg
+        - If ffmpeg is not available or the transcode fails, falls back to copying
+          the input to output.mp4 (previous behavior)
 
         Returns path to generated file on success, or None on failure.
         """
-        logger.info(f"Processing clip (CPU fallback): {clip_id}")
+        logger.info(f"Processing clip (CPU/ffmpeg fallback): {clip_id}")
 
         clip_dir = self.storage_path / clip_id
         if not clip_dir.exists():
@@ -83,22 +142,26 @@ class REDProcessor:
         input_path = files[0]
         output_path = clip_dir / "output.mp4"
 
-        try:
-            # Simulate processing time (short)
-            await asyncio.sleep(2)
+        # Try ffmpeg transcode first
+        success = await self._run_ffmpeg(str(input_path), str(output_path))
+        if success:
+            return str(output_path)
 
-            # For MVP just copy input to output to produce a result file
+        # Fallback: copy the input to output
+        try:
+            # Simulate processing time
+            await asyncio.sleep(1)
             shutil.copyfile(input_path, output_path)
 
-            # If copy produced zero-length file (e.g. a text upload), write a small placeholder
+            # If copy produced zero-length file, write a small placeholder
             if output_path.stat().st_size == 0:
                 with open(output_path, 'wb') as f:
                     f.write(b"RED-QUOTAS-PLACEHOLDER\n")
 
-            logger.info(f"Produced output for {clip_id}: {output_path}")
+            logger.info(f"Produced fallback output for {clip_id}: {output_path}")
             return str(output_path)
         except Exception as e:
-            logger.exception(f"Error processing clip {clip_id}: {e}")
+            logger.exception(f"Error producing fallback output for {clip_id}: {e}")
             return None
 
     async def get_stats(self) -> dict:
