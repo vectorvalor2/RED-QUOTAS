@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import Optional
 import shutil
 import asyncio
-import sys
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ class REDProcessor:
 
     This implementation provides a CPU-backed processing path using ffmpeg
     where available. If ffmpeg is not installed, it falls back to the
-    simple copy behavior used previously.
+    simple copy behavior used previously. Optionally uploads outputs to S3.
     """
 
     def __init__(self, settings):
@@ -24,6 +25,9 @@ class REDProcessor:
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.gpu_available = False
         self.start_time = datetime.utcnow()
+
+        # S3 client (lazily created)
+        self._s3 = None
 
     async def initialize(self):
         """Initialize processor"""
@@ -40,6 +44,23 @@ class REDProcessor:
             except Exception as e:
                 logger.warning(f"GPU not available: {e}")
                 self.gpu_available = False
+
+        # Initialize S3 client if enabled
+        if self.settings.S3_ENABLED and self.settings.S3_BUCKET:
+            try:
+                session_kwargs = {}
+                if self.settings.AWS_ACCESS_KEY_ID and self.settings.AWS_SECRET_ACCESS_KEY:
+                    session_kwargs['aws_access_key_id'] = self.settings.AWS_ACCESS_KEY_ID
+                    session_kwargs['aws_secret_access_key'] = self.settings.AWS_SECRET_ACCESS_KEY
+                # Create boto3 client
+                s3_kwargs = {'region_name': self.settings.S3_REGION}
+                if self.settings.S3_ENDPOINT:
+                    s3_kwargs['endpoint_url'] = self.settings.S3_ENDPOINT
+                self._s3 = boto3.client('s3', **s3_kwargs, **session_kwargs)
+                logger.info("Initialized S3 client")
+            except Exception as e:
+                logger.exception(f"Failed to initialize S3 client: {e}")
+                self._s3 = None
 
     async def shutdown(self):
         """Cleanup resources"""
@@ -115,18 +136,46 @@ class REDProcessor:
             logger.exception(f"Error running ffmpeg: {e}")
             return False
 
-    async def process_clip(self, clip_id: str) -> Optional[str]:
+    async def _upload_to_s3(self, local_path: str, clip_id: str) -> Optional[str]:
+        """Upload local_path to S3 under a key for clip_id and return presigned URL."""
+        if not self._s3:
+            logger.warning("S3 client not initialized; skipping upload")
+            return None
+
+        key = f"clips/{clip_id}/output.mp4"
+
+        def _upload():
+            try:
+                self._s3.upload_file(local_path, self.settings.S3_BUCKET, key)
+                return True
+            except (BotoCoreError, ClientError) as e:
+                logger.exception(f"S3 upload failed: {e}")
+                return False
+
+        ok = await asyncio.to_thread(_upload)
+        if not ok:
+            return None
+
+        # generate presigned URL
+        try:
+            url = self._s3.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.settings.S3_BUCKET, 'Key': key},
+                ExpiresIn=self.settings.S3_SIGNED_URL_EXPIRATION
+            )
+            return url
+        except Exception as e:
+            logger.exception(f"Failed to generate presigned URL: {e}")
+            return None
+
+    async def process_clip(self, clip_id: str) -> Optional[dict]:
         """Process clip through RED pipeline using ffmpeg fallback
 
-        Behavior:
-        - Looks for the first uploaded file in storage_path/{clip_id}/
-        - Attempts to transcode it to H.264 MP4 via ffmpeg
-        - If ffmpeg is not available or the transcode fails, falls back to copying
-          the input to output.mp4 (previous behavior)
-
-        Returns path to generated file on success, or None on failure.
+        Returns a dict with keys:
+          - local_path: path on local filesystem (if produced)
+          - presigned_url: URL to download from S3 (if uploaded)
         """
-        logger.info(f"Processing clip (CPU/ffmpeg fallback): {clip_id}")
+        logger.info(f"Processing clip (CPU/ffmpeg + optional S3): {clip_id}")
 
         clip_dir = self.storage_path / clip_id
         if not clip_dir.exists():
@@ -144,25 +193,32 @@ class REDProcessor:
 
         # Try ffmpeg transcode first
         success = await self._run_ffmpeg(str(input_path), str(output_path))
-        if success:
-            return str(output_path)
+        if not success:
+            # Fallback: copy the input to output
+            try:
+                # Simulate short processing
+                await asyncio.sleep(1)
+                shutil.copyfile(input_path, output_path)
 
-        # Fallback: copy the input to output
-        try:
-            # Simulate processing time
-            await asyncio.sleep(1)
-            shutil.copyfile(input_path, output_path)
+                # If copy produced zero-length file, write a small placeholder
+                if output_path.stat().st_size == 0:
+                    with open(output_path, 'wb') as f:
+                        f.write(b"RED-QUOTAS-PLACEHOLDER\n")
 
-            # If copy produced zero-length file, write a small placeholder
-            if output_path.stat().st_size == 0:
-                with open(output_path, 'wb') as f:
-                    f.write(b"RED-QUOTAS-PLACEHOLDER\n")
+                logger.info(f"Produced fallback output for {clip_id}: {output_path}")
+            except Exception as e:
+                logger.exception(f"Error producing fallback output for {clip_id}: {e}")
+                return None
 
-            logger.info(f"Produced fallback output for {clip_id}: {output_path}")
-            return str(output_path)
-        except Exception as e:
-            logger.exception(f"Error producing fallback output for {clip_id}: {e}")
-            return None
+        result = {"local_path": str(output_path)}
+
+        # Optionally upload to S3 and return presigned URL
+        if self._s3 and self.settings.S3_ENABLED and self.settings.S3_BUCKET:
+            presigned = await self._upload_to_s3(str(output_path), clip_id)
+            if presigned:
+                result["presigned_url"] = presigned
+
+        return result
 
     async def get_stats(self) -> dict:
         """Get system statistics"""

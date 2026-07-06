@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - STORAGE_PATH=/data
+      - S3_ENABLED=${S3_ENABLED:-False}
+      - S3_BUCKET=${S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_REGION=${S3_REGION}
+    volumes:
+      - ./backend:/app
+      - red_data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+  frontend:
+    image: node:18
+    working_dir: /src
+    volumes:
+      - ./frontend:/src
+      - /src/node_modules
+    command: ["npm", "run", "dev"]
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_DEV_PORT=5173
+
+volumes:
+  red_data:

@@ -1,4 +1,3 @@
-"""Worker process for processing queued jobs with optional Redis-backed queue and concurrency."""
 import asyncio
 import logging
 import signal
@@ -86,22 +85,28 @@ class Worker:
                 await self.job_manager.update_job(clip_id, {"progress": 1, "status": "processing"})
 
                 # process
-                output_path = await self.processor.process_clip(clip_id)
+                output = await self.processor.process_clip(clip_id)
 
-                if output_path:
+                if output:
+                    # determine url
+                    presigned = output.get("presigned_url") if isinstance(output, dict) else None
+                    local_path = output.get("local_path") if isinstance(output, dict) else output
+
                     # update job to completed
                     file_size = 0
                     try:
-                        file_size = Path(output_path).stat().st_size
+                        file_size = Path(local_path).stat().st_size if local_path else 0
                     except Exception:
                         pass
+
+                    url = presigned if presigned else (f"file://{local_path}" if local_path else None)
 
                     await self.job_manager.update_job(clip_id, {
                         "progress": 100,
                         "status": "completed",
-                        "url": f"file://{output_path}",
+                        "url": url,
                         "file_size_bytes": file_size,
-                        "completed_at": Path(output_path).stat().st_mtime
+                        "completed_at": Path(local_path).stat().st_mtime if local_path else None
                     })
 
                     # ack / remove from processing list if Redis in use

@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     # Storage
     STORAGE_PATH: str = os.getenv("STORAGE_PATH", "/tmp/red-quotas")
     MAX_FILE_SIZE_MB: int = 5000  # 5GB
+
+    # S3 / Object storage
+    S3_ENABLED: bool = os.getenv("S3_ENABLED", "False") == "True"
+    S3_BUCKET: Optional[str] = os.getenv("S3_BUCKET", None)
+    AWS_ACCESS_KEY_ID: Optional[str] = os.getenv("AWS_ACCESS_KEY_ID", None)
+    AWS_SECRET_ACCESS_KEY: Optional[str] = os.getenv("AWS_SECRET_ACCESS_KEY", None)
+    S3_REGION: Optional[str] = os.getenv("S3_REGION", "us-east-1")
+    S3_ENDPOINT: Optional[str] = os.getenv("S3_ENDPOINT", None)  # for S3-compatible endpoints
+    S3_SIGNED_URL_EXPIRATION: int = int(os.getenv("S3_SIGNED_URL_EXPIRATION", "3600"))
     
     # GPU
     ENABLE_GPU: bool = os.getenv("ENABLE_GPU", "True") == "True"
