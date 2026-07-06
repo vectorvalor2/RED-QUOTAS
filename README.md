@@ -1,1 +1,1 @@
-Inject GUI Dependencies and/or Params, to RED(repli-cant, ex-tract, de-duplicate).QUOTAS/ Searchable Objects % Interchangeable Codeblocks; to create a website that generates futuristic movie clips from different types of input files.
+Inject GUI Dependencies and/or Params to RED(repli-cant, ex-tract, de-duplicate).QUOTAS/ Searchable Objects % Interchangeable Codeblocks; to create a website that generates futuristic movie clips from different types of input files.
