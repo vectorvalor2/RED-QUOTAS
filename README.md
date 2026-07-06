@@ -1,1 +1,1 @@
-Inject Dependencies and/or Params, Vulkan and SIMD to RED(replicant, extract, deduplicate).QUOTAS/ Searchable Objects % Interchangeable Codeblocks; to create a website that generates futuristic movie clips from different types of input files.
+Inject GUI Dependencies and/or Params, to RED(replicant, extract, deduplicate).QUOTAS/ Searchable Objects % Interchangeable Codeblocks; to create a website that generates futuristic movie clips from different types of input files.
