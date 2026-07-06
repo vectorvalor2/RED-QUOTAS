@@ -1,14 +1,4 @@
-"""Simple worker to process queued jobs.
-
-Run this alongside the FastAPI server (separate process). It uses the
-existing JobManager and REDProcessor classes to pick queued jobs,
-process them with a CPU fallback, and update job status.
-
-Usage:
-  cd backend
-  python -m backend.worker
-
-"""
+"""Worker process for processing queued jobs with optional Redis-backed queue and concurrency."""
 import asyncio
 import logging
 import signal
@@ -28,6 +18,7 @@ class Worker:
         self.job_manager = JobManager(self.settings)
         self.processor = REDProcessor(self.settings)
         self._shutdown = False
+        self._tasks = []
 
     async def start(self):
         await self.job_manager.initialize()
@@ -37,18 +28,59 @@ class Worker:
         # graceful shutdown signals
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
+            try:
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
+            except NotImplementedError:
+                # signal handlers not available on Windows event loop
+                pass
 
-        try:
-            while not self._shutdown:
-                # try to pop a job
+        concurrency = getattr(self.settings, "WORKERS", 4)
+        logger.info(f"Starting worker with concurrency={concurrency}")
+
+        # Start background requeue task
+        requeue_task = asyncio.create_task(self._requeue_loop())
+        self._tasks.append(requeue_task)
+
+        # Start worker tasks
+        for i in range(concurrency):
+            t = asyncio.create_task(self._worker_loop(i))
+            self._tasks.append(t)
+
+        # Wait until tasks finish (they run until stop requested)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        # cleanup
+        await self.processor.shutdown()
+        await self.job_manager.shutdown()
+        logger.info("Worker shutdown complete")
+
+    async def stop(self):
+        logger.info("Worker received stop signal")
+        self._shutdown = True
+        # cancel worker tasks
+        for t in self._tasks:
+            t.cancel()
+
+    async def _requeue_loop(self):
+        # periodically requeue stale processing jobs
+        while not self._shutdown:
+            try:
+                await self.job_manager.requeue_stale_processing(max_age_seconds=300)
+            except Exception:
+                logger.exception("Error in requeue loop")
+            await asyncio.sleep(60)
+
+    async def _worker_loop(self, idx: int):
+        logger.info(f"Worker task {idx} started")
+        while not self._shutdown:
+            try:
                 job = await self.job_manager.pop_next_job()
                 if not job:
                     await asyncio.sleep(1.0)
                     continue
 
                 clip_id = job.get("clip_id")
-                logger.info(f"Picked job {clip_id}")
+                logger.info(f"[{idx}] Picked job {clip_id}")
 
                 # update progress
                 await self.job_manager.update_job(clip_id, {"progress": 1, "status": "processing"})
@@ -69,23 +101,27 @@ class Worker:
                         "status": "completed",
                         "url": f"file://{output_path}",
                         "file_size_bytes": file_size,
-                        "completed_at": str(asyncio.get_event_loop().time())
+                        "completed_at": Path(output_path).stat().st_mtime
                     })
-                    logger.info(f"Job {clip_id} completed")
+
+                    # ack / remove from processing list if Redis in use
+                    try:
+                        await self.job_manager.ack_completed(clip_id)
+                    except Exception:
+                        pass
+
+                    logger.info(f"[{idx}] Job {clip_id} completed")
                 else:
                     await self.job_manager.update_job(clip_id, {"progress": 0, "status": "failed", "error_message": "processing failed"})
-                    logger.error(f"Job {clip_id} failed")
+                    logger.error(f"[{idx}] Job {clip_id} failed")
 
                 # small delay to yield
                 await asyncio.sleep(0.1)
-        finally:
-            await self.processor.shutdown()
-            await self.job_manager.shutdown()
-            logger.info("Worker shutdown complete")
-
-    async def stop(self):
-        logger.info("Worker received stop signal")
-        self._shutdown = True
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Unexpected error in worker loop")
+                await asyncio.sleep(1.0)
 
 
 async def main():
@@ -94,4 +130,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
